@@ -28,7 +28,7 @@ jobs:
         uses: docker/metadata-action@v5
         id: metadata
         with:
-          images: amneziavpn/mtproxy
+          images: amneziavpn/tproxy
           tags: type=semver,pattern={{version}}
 
       - name: Set up Docker Buildx
