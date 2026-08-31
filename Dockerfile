@@ -1,27 +1,68 @@
-FROM golang:alpine AS builder
+# syntax=docker/dockerfile:1
+# Hub image builder for the Telegram WEB proxy (amneziavpn/tproxy).
+#
+# This is the from-source recipe that produces the prebuilt image pushed to
+# Docker Hub as amneziavpn/tproxy:latest. The app-side Dockerfile
+# (client/server_scripts/tproxy/Dockerfile) only does `FROM amneziavpn/tproxy:latest`,
+# so end-user installs pull this image instead of compiling on the VPS.
+#
+# MTProxy is x86_64-only, so build/push for linux/amd64:
+#   docker buildx build --platform linux/amd64 -t amneziavpn/tproxy:latest \
+#       -f docs/tproxy/Dockerfile --push docs/tproxy
+#
+# Bump the *_COMMIT / Caddy version below when updating, then rebuild and push.
 
-LABEL stage=gobuilder
+FROM golang:1.22-bookworm AS relay
+WORKDIR /src
+ARG TPROXY_COMMIT=2873a08806d6e4d84830b9b5c4b0ec0f46af91f8
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*; \
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 10 --max-time 120 \
+        -o /tmp/tproxy.tar.gz \
+        "https://github.com/telegramdesktop/tproxy-server/archive/${TPROXY_COMMIT}.tar.gz"; \
+    tar -xzf /tmp/tproxy.tar.gz -C /src --strip-components=1; \
+    go build -trimpath -o /out/tproxy-server ./cmd/tproxy-server
 
-ENV CGO_ENABLED 0
+FROM debian:12-slim AS mtproxy
+ARG MTPROXY_COMMIT=f36d8af769ffaeac36978d38c2c0f6d1104c2137
+ARG MTPROXY_SHA256=919795c416b870670841a21d1930ad97a24c7b84b9eb8c6f9e3de32f2fdf4655
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential libssl-dev zlib1g-dev make && \
+    rm -rf /var/lib/apt/lists/*; \
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 10 --max-time 120 \
+        -o /tmp/MTProxy.tar.gz \
+        "https://github.com/TelegramMessenger/MTProxy/archive/${MTPROXY_COMMIT}.tar.gz"; \
+    echo "${MTPROXY_SHA256}  /tmp/MTProxy.tar.gz" | sha256sum -c -; \
+    mkdir -p /src && tar -xzf /tmp/MTProxy.tar.gz -C /src --strip-components=1; \
+    make -C /src -j"$(nproc)"; \
+    test -x /src/objs/bin/mtproto-proxy; \
+    install -m 0755 /src/objs/bin/mtproto-proxy /mtproto-proxy
 
-RUN apk update --no-cache && apk add --no-cache tzdata
+FROM debian:12-slim
+RUN set -eux; \
+    ARCH="$(uname -m)"; \
+    if [ "$ARCH" != "x86_64" ]; then \
+        echo "tproxy-server requires an x86_64 server (official MTProxy is x86_64-only)" >&2; \
+        exit 1; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl openssl libssl3 zlib1g && \
+    rm -rf /var/lib/apt/lists/*; \
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 10 --max-time 120 \
+        -o /tmp/caddy.tgz \
+        "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz"; \
+    tar -xzf /tmp/caddy.tgz -C /usr/local/bin caddy; \
+    chmod 0755 /usr/local/bin/caddy; \
+    rm -f /tmp/caddy.tgz
 
-WORKDIR /build
+COPY --from=relay /out/tproxy-server /usr/local/bin/tproxy-server
+COPY --from=mtproxy /mtproto-proxy /usr/local/bin/mtproto-proxy
 
-ADD go.mod .
-ADD go.sum .
-RUN go mod download
-COPY . .
-RUN go build -ldflags="-s -w" -o /app/tproxy .
+RUN mkdir -p /opt/amnezia /data /data/site /data/caddy \
+ && printf '#!/bin/sh\ntail -f /dev/null\n' > /opt/amnezia/start.sh \
+ && chmod a+x /opt/amnezia/start.sh /usr/local/bin/tproxy-server /usr/local/bin/mtproto-proxy
 
-
-FROM scratch
-
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /usr/share/zoneinfo/Asia/Shanghai /usr/share/zoneinfo/Asia/Shanghai
-ENV TZ Asia/Shanghai
-
-WORKDIR /app
-COPY --from=builder /app/tproxy /usr/local/bin/tproxy
-
-CMD ["tproxy"]
+VOLUME /data
+ENTRYPOINT ["/bin/sh", "/opt/amnezia/start.sh"]
+CMD [""]
